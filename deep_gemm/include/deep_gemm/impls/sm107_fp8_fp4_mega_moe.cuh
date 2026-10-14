@@ -11,7 +11,7 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/mma/sm100.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/scheduler/sm107_mega_moe.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -44,6 +44,12 @@ template <
     uint32_t kEpiPrefetchStages,
     uint32_t kDispatchPipe,
     uint32_t kWeightPrefetch,
+    // Per-die (locality domain) execution: `kNumLocalityDomains` task queues, each owning the N half of every weight
+    // matrix homed in its domain; `kLocalizedWeights` / `kLocalizedSharedWeights`: routed / shared weights are given as
+    // `(2, [E,] N / 2, K)` with slice `d` homed in locality domain `d` (3D TMA: K, rows of the half, domain)
+    uint32_t kNumLocalityDomains,
+    bool kLocalizedWeights,
+    bool kLocalizedSharedWeights,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -84,7 +90,8 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
-                            uint64_t* trace) {
+                            uint64_t* trace,
+                            const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -339,13 +346,13 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
         trace_set(0, trace_now()), trace_set(60, clock64());
 
     // Task scheduler
-    auto scheduler = sched::MegaMoEScheduler<
+    auto scheduler = sched::MegaMoESchedulerLD<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
-        kNumRingBlocks,
+        kNumRingBlocks, kNumLocalityDomains,
         kNumSharedExperts>(
             workspace,
             shared_storage.task_info_full_barriers,
@@ -755,6 +762,11 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_l2_task_count_ptr() = 0;
                 *workspace.get_shared_l1_task_count_ptr() = 0;
                 *workspace.get_shared_l2_task_count_ptr() = 0;
+                if constexpr (kNumLocalityDomains > 1) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 4; ++ i)
+                        workspace.signals->task_count_domain1[i] = 0;
+                }
             }
             __syncwarp();
             for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks; i += kNumDispatchThreads)
@@ -915,6 +927,10 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
             const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             const bool half_k = kSharedHalfK and task_info.is_shared();
             const auto num_k_blocks = math::ceil_div(shape_k, half_k ? SHARED_BLOCK_K : BLOCK_K);
+            // Localized weights: N half `half_idx` of every matrix is slice `half_idx`, rows `[expert][N / 2]` inside it
+            const uint32_t half_n = shape_n / 2, n_in_matrix = n_block_idx * BLOCK_N, half_idx = n_in_matrix >= half_n ? 1u : 0u;
+            const uint32_t half_row = (task_info.is_shared() ? 0u : task_info.local_expert_idx * half_n) + n_in_matrix - half_idx * half_n;
+            DG_STATIC_ASSERT(not kLocalizedWeights or kWeightPrefetch == 0, "L2 weight prefetch assumes 2D weights");
 
             // Optional L2 prefetch of routed weight tiles `kWeightPrefetch` k-blocks ahead of the smem pipeline (hides DRAM
             // latency beyond the stage count); results are unaffected
@@ -956,9 +972,15 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
                 }
                 if (cute::elect_one_sync()) {
                     if (task_info.is_shared()) {
-                        tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleSharedBMode, shared_b_dtype_t>(
-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]),
-                            half_k ? k_block_idx * SHARED_BLOCK_K : k_idx, n_idx, 2);
+                        if constexpr (kLocalizedSharedWeights) {
+                            tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleSharedBMode, shared_b_dtype_t, true>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]),
+                                half_k ? k_block_idx * SHARED_BLOCK_K : k_idx, half_row, 2, half_idx);
+                        } else {
+                            tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleSharedBMode, shared_b_dtype_t>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]),
+                                half_k ? k_block_idx * SHARED_BLOCK_K : k_idx, n_idx, 2);
+                        }
                         tma::copy<BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx,
                             half_k ? k_block_idx * SHARED_BLOCK_K / 128 : sfb_k_idx, 2);
@@ -969,8 +991,13 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
                     } else {
-                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t>(
-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+                        if constexpr (kLocalizedWeights) {
+                            tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t, true>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, half_row, 2, half_idx);
+                        } else {
+                            tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+                        }
                         tma::copy<BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                         if (is_leader_cta) {
@@ -1175,7 +1202,7 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
-            scheduler.mainloop(num_tokens);
+            scheduler.mainloop(num_tokens, sm_locality_domains);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();

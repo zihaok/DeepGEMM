@@ -19,6 +19,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 #include "locality_domain.hpp"
 #include "../jit_kernels/impls/sm107_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm107_locality.hpp"
 
 namespace deep_gemm::mega {
 
@@ -312,10 +313,22 @@ static void fp8_fp4_mega_moe(
     }
 
     // Tensor checks
+    // NOTES: the opt-in SM107 per-die path also accepts weights localized into the 2 locality domains:
+    // routed `(2, E, N / 2, K)` and shared `(2, N / 2, K)`, slice `d` homed in domain `d` (see `sm107_locality.hpp`)
+    const bool localized_weights = l1_weights.dim() == 4;
     const auto arch_major = jit->device.get_arch_major();
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_weights_layout_3d(l1_weights);
-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
-    DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
+    const auto check_routed_weights = [&](const torch::stable::Tensor& w) -> std::tuple<int, int, int> {
+        if (not localized_weights) {
+            DG_HOST_ASSERT(get_major_type_ab(w) == cute::UMMA::Major::K);
+            return check_grouped_ab_fp8_fp4(w, cute::UMMA::Major::K, arch_major);
+        }
+        DG_HOST_ASSERT(w.dim() == 4 and sm107_locality::is_localized(w));
+        DG_HOST_ASSERT(w.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn or w.scalar_type() == kPackedFP4);
+        const int k = static_cast<int>(w.size(3)) * (w.scalar_type() == kPackedFP4 ? 2 : 1);
+        return {static_cast<int>(w.size(1)), static_cast<int>(w.size(0) * w.size(2)), k};
+    };
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_routed_weights(l1_weights);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_routed_weights(l2_weights);
     const auto weight_dtype = l1_weights.scalar_type();
     DG_HOST_ASSERT(weight_dtype == torch::headeronly::ScalarType::Float8_e4m3fn or weight_dtype == kPackedFP4);
     DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
@@ -323,6 +336,7 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(localized_weights or (l1_weights.is_contiguous() and l2_weights.is_contiguous()));
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -332,15 +346,25 @@ static void fp8_fp4_mega_moe(
                     num_experts_per_rank, true, false, torch::headeronly::ScalarType::Int);
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
+    bool localized_shared_weights = false;
     torch::stable::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
     if (shared_l1_weights_tuple_opt.has_value()) {
         std::tie(shared_l1_weights, shared_l1_weights_sf) = shared_l1_weights_tuple_opt.value();
         std::tie(shared_l2_weights, shared_l2_weights_sf) = shared_l2_weights_tuple_opt.value();
-        const auto [shared_l1_n, shared_l1_k] = check_weights_layout_2d(shared_l1_weights);
-        const auto [shared_l2_n, shared_l2_k] = check_weights_layout_2d(shared_l2_weights);
-        DG_HOST_ASSERT(is_localized(shared_l1_weights) == is_localized(l1_weights));
-        DG_HOST_ASSERT(is_localized(shared_l2_weights) == is_localized(l2_weights));
-        shared_intermediate_hidden = shared_l2_k;
+        // Logical `(N, K)` of plain `(N, K)` or localized `(2, N / 2, K)` shared weights
+        const auto get_shared_shape = [&](const torch::stable::Tensor& w) -> std::pair<int64_t, int64_t> {
+            if (w.dim() != 3) {
+                DG_HOST_ASSERT(w.dim() == 2 and w.is_contiguous() and get_major_type_ab(w) == cute::UMMA::Major::K);
+                return {w.size(0), w.size(1)};
+            }
+            DG_HOST_ASSERT(w.dim() == 3 and sm107_locality::is_localized(w));
+            return {w.size(0) * w.size(1), w.size(2)};
+        };
+        const auto [shared_l1_n, shared_l1_k] = get_shared_shape(shared_l1_weights);
+        const auto [shared_l2_n, shared_l2_k] = get_shared_shape(shared_l2_weights);
+        DG_HOST_ASSERT(shared_l1_weights.dim() == shared_l2_weights.dim());
+        localized_shared_weights = shared_l1_weights.dim() == 3;
+        shared_intermediate_hidden = static_cast<int>(shared_l2_k);
         num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
 
         DG_HOST_ASSERT(shared_intermediate_hidden % intermediate_hidden == 0);
@@ -406,6 +430,8 @@ static void fp8_fp4_mega_moe(
         // Opt-in Rubin (SM107) kernel: `DG_MEGA_MOE_SM107=1` on a compute capability 10.7 device
         const auto [arch_major_, arch_minor] = jit->device.get_arch_pair();
         const bool use_sm107 = arch_minor == 7 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107", 0) != 0;
+        DG_HOST_ASSERT((not (localized_weights or localized_shared_weights) or (use_sm107 and activation == "swiglu")) and
+                       "localized MegaMoE weights need the SM107 kernel (DG_MEGA_MOE_SM107=1)");
         if (activation == "situ") {
             launch(sm100_fp8_fp4_mega_moe_situ,
                    activation_alpha, activation_beta, fast_math);
