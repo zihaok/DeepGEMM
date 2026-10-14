@@ -12,8 +12,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from .. import _C
-
 _ops = torch.ops.deep_gemm
 _balanced_domains = None
 
@@ -24,6 +22,18 @@ def get_num_locality_domains() -> int:
 
 def is_localization_available() -> bool:
     return torch.cuda.get_device_capability() == (10, 7) and get_num_locality_domains() == 2
+
+
+def _balance_sm_locality_domains(sm_domain: torch.Tensor) -> torch.Tensor:
+    tpcs = sm_domain.view(-1, 2)
+    tpc_domain = tpcs.select(1, 0)
+    num_tpcs = tpcs.size(0)
+    assert num_tpcs % 2 == 0
+    larger = int(tpc_domain.sum().item() * 2 > num_tpcs)
+    surplus = (tpc_domain == larger).nonzero().flatten()[num_tpcs // 2:]
+    balanced = sm_domain.clone()
+    balanced.view(-1, 2).index_fill_(0, surplus, larger ^ 1)
+    return balanced
 
 
 def get_balanced_sm_locality_domains() -> torch.Tensor:
@@ -57,7 +67,7 @@ def get_balanced_sm_locality_domains() -> torch.Tensor:
             import warnings
             warnings.warn("SM107 locality probe found no stable mapping; using an even mapping")
             domains = (torch.arange(num_sms // 2, device="cuda") % 2).to(torch.uint8).repeat_interleave(2)
-        _balanced_domains = _C._balance_sm_locality_domains(domains)
+        _balanced_domains = _balance_sm_locality_domains(domains)
         _ops.sm107_set_balanced_sm_locality_domains(_balanced_domains)
     return _balanced_domains
 
