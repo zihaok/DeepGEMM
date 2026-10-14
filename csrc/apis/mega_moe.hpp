@@ -18,6 +18,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_situ.hpp"
 #include "locality_domain.hpp"
+#include "../jit_kernels/impls/sm107_fp8_fp4_mega_moe.hpp"
 
 namespace deep_gemm::mega {
 
@@ -402,9 +403,15 @@ static void fp8_fp4_mega_moe(
                    hidden, intermediate_hidden,
                    activation_args...);
         };
+        // Opt-in Rubin (SM107) kernel: `DG_MEGA_MOE_SM107=1` on a compute capability 10.7 device
+        const auto [arch_major_, arch_minor] = jit->device.get_arch_pair();
+        const bool use_sm107 = arch_minor == 7 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107", 0) != 0;
         if (activation == "situ") {
             launch(sm100_fp8_fp4_mega_moe_situ,
                    activation_alpha, activation_beta, fast_math);
+        } else if (use_sm107) {
+            launch(sm107_fp8_fp4_mega_moe,
+                   activation_clamp, activation_alpha, activation_beta, fast_math);
         } else {
             launch(sm100_fp8_fp4_mega_moe,
                    activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);

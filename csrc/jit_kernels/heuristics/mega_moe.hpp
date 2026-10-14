@@ -108,6 +108,10 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
                 break;
         }
     }
+    // Opt-in experiment for the SM107 MegaMoE fork only: force `block_m` (both the Python-side
+    // `get_block_m_for_mega_moe` and the kernel go through here, so the two stay consistent)
+    if (deep_jit::get_env<int>("DG_MEGA_MOE_SM107") and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_BLOCK_M") > 0)
+        block_m = deep_jit::get_env<int>("DG_MEGA_MOE_SM107_BLOCK_M");
 
     // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
     const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 :
