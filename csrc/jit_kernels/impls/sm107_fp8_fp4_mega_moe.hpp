@@ -3,7 +3,8 @@
 #include <array>
 #include <filesystem>
 #include <format>
-#include <torch/python.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -20,7 +21,7 @@ namespace deep_gemm {
 // function is switched to `CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY` (which is what grants more than the
 // portable opt-in size; `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` must not be set then)
 template <typename Kernel, typename... Args>
-static void sm107_launch_oversized(const Kernel& kernel, const deep_jit::cuda::LaunchOptions& options, const Args&... args) {
+static void sm107_launch_oversized(const Kernel& kernel, const deep_jit::cuda::LaunchOptions& options, const cudaStream_t stream, const Args&... args) {
     using namespace deep_jit::cuda;
     DJ_CUDA_DRIVER_CHECK(driver::lazy_cuFuncSetAttribute(
         kernel.kernel_handle, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
@@ -43,7 +44,7 @@ static void sm107_launch_oversized(const Kernel& kernel, const deep_jit::cuda::L
     config.gridDimX = options.grid_dim->x, config.gridDimY = options.grid_dim->y, config.gridDimZ = options.grid_dim->z;
     config.blockDimX = options.block_dim->x, config.blockDimY = options.block_dim->y, config.blockDimZ = options.block_dim->z;
     config.sharedMemBytes = *options.num_smem_bytes;
-    config.hStream = options.stream ? *options.stream : at::cuda::getCurrentCUDAStream().stream();
+    config.hStream = options.stream ? *options.stream : stream;
     config.attrs = num_attributes == 0 ? nullptr : attributes.data();
     config.numAttrs = num_attributes;
     DJ_CUDA_DRIVER_CHECK(driver::lazy_cuLaunchKernelEx(&config, kernel.kernel_handle, kernel_arg_ptrs, nullptr));
@@ -61,16 +62,17 @@ static void sm107_launch_oversized(const Kernel& kernel, const deep_jit::cuda::L
 //   DG_MEGA_MOE_SM107_ARCH:            JIT target override, default the image's "100f"; "107a" uses CUTLASS 4.8 headers
 //   DG_MEGA_MOE_SM107_TRACE_PTR / _DEBUG: debug-only tracing and component skipping (results invalid with _DEBUG)
 static void sm107_fp8_fp4_mega_moe(
-    const torch::Tensor& y,
-    const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
-    const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
-    const torch::Tensor& shared_l1_acts, const torch::Tensor& shared_l1_acts_sf,
-    const torch::Tensor& shared_l2_acts, const torch::Tensor& shared_l2_acts_sf,
-    const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
-    const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
-    const torch::Tensor& shared_l1_weights, const torch::Tensor& shared_l2_weights,
-    const torch::Tensor& shared_l1_weights_sf, const torch::Tensor& shared_l2_weights_sf,
-    const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const torch::stable::Tensor& y,
+    const torch::stable::Tensor& l1_acts, const torch::stable::Tensor& l1_acts_sf,
+    const torch::stable::Tensor& l2_acts, const torch::stable::Tensor& l2_acts_sf,
+    const torch::stable::Tensor& shared_l1_acts, const torch::stable::Tensor& shared_l1_acts_sf,
+    const torch::stable::Tensor& shared_l2_acts, const torch::stable::Tensor& shared_l2_acts_sf,
+    const torch::stable::Tensor& l1_weights, const torch::stable::Tensor& l2_weights,
+    const torch::stable::Tensor& l1_weights_sf, const torch::stable::Tensor& l2_weights_sf,
+    const torch::stable::Tensor& shared_l1_weights, const torch::stable::Tensor& shared_l2_weights,
+    const torch::stable::Tensor& shared_l1_weights_sf, const torch::stable::Tensor& shared_l2_weights_sf,
+    const torch::stable::Tensor& upstream_sm_locality_domains,
+    const std::optional<torch::stable::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
@@ -95,6 +97,10 @@ static void sm107_fp8_fp4_mega_moe(
         num_ring_tokens, num_sf_ring_tokens,
         MmaKind::MXFP8FP4);
 
+    // Preserve the fork's symmetric epilogue tiling independently of SM100.
+    const int store_block_m = config.block_m <= 16 ? 8 : config.block_m <= 64 ? 16 :
+                              config.block_m <= 192 ? 32 : 40;
+
     // K per pipeline stage (`DG_MEGA_MOE_SM107_BLOCK_K`, 128 or 256): 256 halves the per-k-block handshakes
     config.block_k = deep_jit::get_env<int>("DG_MEGA_MOE_SM107_BLOCK_K", config.block_k);
     DG_HOST_ASSERT(config.block_k == 128 or config.block_k == 256);
@@ -108,7 +114,7 @@ static void sm107_fp8_fp4_mega_moe(
         const auto get_pipeline = [&](const int& capacity) {
             return get_pipeline_config_for_mega_moe(
                 capacity, num_experts, hidden,
-                config.block_m, config.block_n, config.block_k, config.num_bytes_per_pull, config.store_block_m,
+                config.block_m, config.block_n, config.block_k, config.num_bytes_per_pull, store_block_m, store_block_m,
                 config.sf_block_m, config.sf_block_n, 32,
                 config.num_dispatch_threads / 32, config.num_epilogue_threads / 32, MmaKind::MXFP8FP4);
         };
@@ -149,7 +155,7 @@ static void sm107_fp8_fp4_mega_moe(
                                                         config.num_sf_ring_tokens, hidden,
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
-                                                        sf_smem_outer_dim);
+                                                        sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
     // NOTES: the SM107 K=64 UMMA reads FP4 operands densely packed; keep routed FP4 weights packed in smem (64B swizzle)
     const int umma_k_ = deep_jit::get_env<int>("DG_MEGA_MOE_SM107_UMMA_K", 64);
     const bool fp4_packed_smem = umma_k_ == 64 and l1_weights.scalar_type() == kPackedFP4;
@@ -157,7 +163,7 @@ static void sm107_fp8_fp4_mega_moe(
     // Localized weights (per-die path): `(2, [E,] N / 2, K)` -> 3D TMA `(K, [E x] N / 2, 2)`
     const bool localized_weights = l1_weights.dim() == 4;
     const bool localized_shared_weights = num_shared_experts > 0 and shared_l1_weights.dim() == 3;
-    const auto make_weights_desc = [&](const torch::Tensor& w, const bool& localized, const int& shape_k, const int& num_rows,
+    const auto make_weights_desc = [&](const torch::stable::Tensor& w, const bool& localized, const int& shape_k, const int& num_rows,
                                        const int& block_k, const int& swizzle, const bool& packed) {
         if (not localized)
             return make_tma_2d_desc(w, shape_k, num_rows, block_k, config.load_block_n,
@@ -172,13 +178,13 @@ static void sm107_fp8_fp4_mega_moe(
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
-                                                           sf_smem_outer_dim);
+                                                           sf_smem_outer_dim, static_cast<int>(l1_weights_sf.stride(-1)));
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
     // so the swizzle mode is also halved (128 -> 64).
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_ring_tokens,
-                                                       config.block_n / 2, config.store_block_m,
+                                                       config.block_n / 2, store_block_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
@@ -190,14 +196,14 @@ static void sm107_fp8_fp4_mega_moe(
                                                         config.num_sf_ring_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
-                                                        sf_smem_outer_dim);
+                                                        sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
     const auto tensor_map_l2_weights = make_weights_desc(l2_weights, localized_weights, intermediate_hidden, num_experts_per_rank * hidden,
                                                          config.block_k, routed_swizzle_weights_mode, fp4_packed_smem);
     const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
-                                                        sf_smem_outer_dim);
+                                                        sf_smem_outer_dim, static_cast<int>(l2_weights_sf.stride(-1)));
 
     // Half-K shared stages (packed FP4 mode): 64-K boxes with 64B swizzle for the shared tokens and FP8 weights
     const int shared_block_k = fp4_packed_smem ? config.block_k / 2 : config.block_k;
@@ -213,7 +219,7 @@ static void sm107_fp8_fp4_mega_moe(
         static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
         config.sf_block_m, kGranK,
         1, 0, 0, false,
-        sf_smem_outer_dim) : tensor_map_l1_acts_sf;
+        sf_smem_outer_dim, static_cast<int>(shared_l1_acts_sf.stride(-1))) : tensor_map_l1_acts_sf;
     const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ?
         make_weights_desc(shared_l1_weights, localized_shared_weights, hidden, shared_intermediate_hidden * 2, shared_block_k, shared_swizzle, false) :
         tensor_map_l1_weights;
@@ -222,11 +228,11 @@ static void sm107_fp8_fp4_mega_moe(
         shared_intermediate_hidden * 2, hidden,
         config.block_n, kGranK,
         1, 0, 0, false,
-        sf_smem_outer_dim) : tensor_map_l1_weights_sf;
+        sf_smem_outer_dim, static_cast<int>(shared_l1_weights_sf.stride(-1))) : tensor_map_l1_weights_sf;
     const auto tensor_map_shared_l1_output = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
         shared_intermediate_hidden, num_max_tokens_per_rank,
-        config.block_n / 2, config.store_block_m,
+        config.block_n / 2, store_block_m,
         static_cast<int>(shared_l2_acts.stride(-2)),
         config.swizzle_acts_mode / 2) : tensor_map_l1_output;
     const auto tensor_map_shared_l2_acts = num_shared_experts > 0 ? make_tma_2d_desc(
@@ -240,7 +246,7 @@ static void sm107_fp8_fp4_mega_moe(
         static_cast<int>(shared_l2_acts_sf.size(0)), shared_intermediate_hidden,
         config.sf_block_m, kGranK,
         1, 0, 0, false,
-        sf_smem_outer_dim) : tensor_map_l2_acts_sf;
+        sf_smem_outer_dim, static_cast<int>(shared_l2_acts_sf.stride(-1))) : tensor_map_l2_acts_sf;
     const auto tensor_map_shared_l2_weights = num_shared_experts > 0 ?
         make_weights_desc(shared_l2_weights, localized_shared_weights, shared_intermediate_hidden, hidden, shared_block_k, shared_swizzle, false) :
         tensor_map_l2_weights;
@@ -249,12 +255,12 @@ static void sm107_fp8_fp4_mega_moe(
         hidden, shared_intermediate_hidden,
         config.block_n, kGranK,
         1, 0, 0, false,
-        sf_smem_outer_dim) : tensor_map_l2_weights_sf;
+        sf_smem_outer_dim, static_cast<int>(shared_l2_weights_sf.stride(-1))) : tensor_map_l2_weights_sf;
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
-        cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+        cumulative_local_expert_recv_stats_ptr = static_cast<int*>(cumulative_local_expert_recv_stats->data_ptr());
 
     const auto num_sms = runtime->get_num_sms();
 
@@ -269,7 +275,7 @@ static void sm107_fp8_fp4_mega_moe(
     const int num_locality_domains = deep_jit::get_env<int>("DG_MEGA_MOE_SM107_PERDIE", 0) != 0 and clusters_split and
         sm107_locality::get_num_locality_domains() == 2 ? 2 : 1;
     DG_HOST_ASSERT(not (localized_weights or localized_shared_weights) or clusters_split);
-    const auto sm_locality_domains = num_locality_domains > 1 ? sm107_locality::get_balanced_sm_locality_domains() : torch::Tensor();
+    const auto sm_locality_domains = num_locality_domains > 1 ? sm107_locality::get_balanced_sm_locality_domains() : torch::stable::Tensor();
     DG_HOST_ASSERT(num_locality_domains == 1 or sm_locality_domains.numel() == num_sms);
     DG_HOST_ASSERT(not localized_weights or deep_jit::get_env<int>("DG_MEGA_MOE_SM107_PREFETCH", 0) == 0);
     deep_jit::cuda::CompilerOptions compiler_options;
@@ -324,7 +330,7 @@ static void __instantiate_kernel() {{
         num_experts, num_shared_experts,
         num_topk,
         config.block_m, config.block_n, config.block_k,
-        config.store_block_m,
+        store_block_m,
         config.sf_block_m, config.sf_block_n,
         config.num_ring_tokens,
         config.num_sf_ring_tokens,
@@ -357,7 +363,7 @@ static void __instantiate_kernel() {{
     const bool oversized_smem = config.smem_size > SM100ArchSpec::smem_capacity;
     const auto launch_fn = [&](const auto&... args) {
         if (oversized_smem)
-            sm107_launch_oversized(*kernel, jit->default_launch_options.override_with(launch_options), args...);
+            sm107_launch_oversized(*kernel, jit->default_launch_options.override_with(launch_options), torch_compat::current_stream(y), args...);
         else
             jit->launch(kernel, launch_options, args...);
     };
@@ -385,7 +391,7 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf,
         reinterpret_cast<uint64_t*>(trace_ptr),
-        num_locality_domains > 1 ? sm_locality_domains.data_ptr<uint8_t>() : nullptr);
+        num_locality_domains > 1 ? static_cast<const uint8_t*>(sm_locality_domains.data_ptr()) : nullptr);
 }
 
 } // namespace deep_gemm

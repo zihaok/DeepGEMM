@@ -764,8 +764,12 @@ sm107_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_shared_l2_task_count_ptr() = 0;
                 if constexpr (kNumLocalityDomains > 1) {
                     #pragma unroll
-                    for (uint32_t i = 0; i < 4; ++ i)
-                        workspace.signals->task_count_domain1[i] = 0;
+                    for (uint32_t i = 1; i < kNumLocalityDomains; ++ i) {
+                        workspace.get_l1_task_count_ptr()[i] = 0;
+                        workspace.get_l2_task_count_ptr()[i] = 0;
+                        workspace.get_shared_l1_task_count_ptr()[i] = 0;
+                        workspace.get_shared_l2_task_count_ptr()[i] = 0;
+                    }
                 }
             }
             __syncwarp();
