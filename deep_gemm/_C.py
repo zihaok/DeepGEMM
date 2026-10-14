@@ -773,7 +773,7 @@ def _balance_sm_locality_domains(sm_domain):
     num_tpcs = tpcs.size(0)
     assert num_tpcs % 2 == 0
     larger = int(tpc_domain.sum().item() * 2 > num_tpcs)
-    surplus = (tpc_domain == larger).nonzero().flatten()[:num_tpcs // 2]
+    surplus = (tpc_domain == larger).nonzero().flatten()[num_tpcs // 2:]
     balanced = sm_domain.clone()
     balanced.view(-1, _NUM_SMS_PER_TPC).index_fill_(0, surplus, larger ^ 1)
     return balanced
