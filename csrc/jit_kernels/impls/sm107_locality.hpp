@@ -16,10 +16,11 @@
 #include <mutex>
 #include <vector>
 
-#include <c10/cuda/CUDAFunctions.h>
-#include <c10/util/accumulate.h>
-#include <c10/util/strides.h>
-#include <torch/python.h>
+#include <numeric>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include "../../utils/torch_compat.hpp"
+#include "../../apis/locality_domain.hpp"
 #include <deep_jit/backend/cuda/driver.hpp>
 
 #include "../../runtime/runtime.hpp"
@@ -43,8 +44,10 @@ DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuMemRelease);
 DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuPointerGetAttribute);
 
 static CUdevice get_device() {
+    int ordinal = 0;
+    DG_CUDA_RUNTIME_CHECK(cudaGetDevice(&ordinal));
     CUdevice device;
-    DJ_CUDA_DRIVER_CHECK(lazy_cuDeviceGet(&device, static_cast<int>(c10::cuda::current_device())));
+    DJ_CUDA_DRIVER_CHECK(lazy_cuDeviceGet(&device, ordinal));
     return device;
 }
 
@@ -107,7 +110,7 @@ static void release(void* ptr) {
 
 // `torch.empty((num_domains, *sizes), dtype=dtype)` with slice `d` homed in locality domain `d`
 // (slices are padded to the allocation granularity, so `stride(0)` may exceed `prod(sizes)`)
-static torch::Tensor empty_per_domain(const std::vector<int64_t>& sizes, const torch::ScalarType& dtype) {
+static torch::stable::Tensor empty_per_domain(const std::vector<int64_t>& sizes, const torch::headeronly::ScalarType& dtype) {
 #if CUDA_VERSION >= 13040
     const int num_domains = get_num_locality_domains();
     DG_HOST_ASSERT(num_domains > 1 and "this GPU has a single locality domain");
@@ -121,8 +124,8 @@ static torch::Tensor empty_per_domain(const std::vector<int64_t>& sizes, const t
     size_t granularity = 0;
     DJ_CUDA_DRIVER_CHECK(lazy_cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
-    const auto elem_size = static_cast<int64_t>(c10::elementSize(dtype));
-    const auto num_slice_bytes = align<int64_t>(c10::multiply_integers(sizes) * elem_size, static_cast<int64_t>(granularity));
+    const auto elem_size = static_cast<int64_t>(torch_compat::element_size(dtype));
+    const auto num_slice_bytes = align<int64_t>(locality_domain::numel(sizes) * elem_size, static_cast<int64_t>(granularity));
     DG_HOST_ASSERT(num_slice_bytes % elem_size == 0);
 
     CUdeviceptr base = 0;
@@ -149,23 +152,29 @@ static torch::Tensor empty_per_domain(const std::vector<int64_t>& sizes, const t
 
     std::vector<int64_t> full_sizes = {num_domains}, strides = {num_slice_bytes / elem_size};
     full_sizes.insert(full_sizes.end(), sizes.begin(), sizes.end());
-    const auto slice_strides = c10::contiguous_strides(sizes);
+    const auto slice_strides = locality_domain::contiguous_strides(sizes);
     strides.insert(strides.end(), slice_strides.begin(), slice_strides.end());
-    return torch::from_blob(reinterpret_cast<void*>(base), full_sizes, strides, release,
-                            torch::dtype(dtype).device(torch::kCUDA, c10::cuda::current_device()));
+    // Stable ABI 2.10 has no from_blob deleter. Like the base allocator,
+    // reservations are process-owned so views can outlive the original tensor.
+    return torch::stable::from_blob(reinterpret_cast<void*>(base), full_sizes, strides,
+                                    locality_domain::current_cuda_device(), dtype);
 #else
     DG_HOST_UNREACHABLE("locality domains need CUDA >= 13.4 headers");
 #endif
 }
 
 // Whether `t` is `(num_domains, ...)` with contiguous slices and slice `d` homed in domain `d`
-static bool is_localized(const torch::Tensor& t) {
+static bool is_localized(const torch::stable::Tensor& t) {
     const int num_domains = get_num_locality_domains();
     if (num_domains < 2 or t.dim() < 2 or t.size(0) != num_domains)
         return false;
-    const auto slice_sizes = t.sizes().slice(1);
-    if (t.strides().slice(1) != c10::IntArrayRef(c10::contiguous_strides(slice_sizes)))
-        return false;
+    std::vector<int64_t> slice_sizes;
+    for (int i = 1; i < t.dim(); ++i)
+        slice_sizes.push_back(t.size(i));
+    const auto strides = locality_domain::contiguous_strides(slice_sizes);
+    for (int i = 1; i < t.dim(); ++i)
+        if (t.stride(i) != strides[i - 1])
+            return false;
     for (int d = 0; d < num_domains; ++ d) {
         const auto ptr = reinterpret_cast<int64_t>(static_cast<const char*>(t.data_ptr()) + d * t.stride(0) * t.element_size());
         if (get_locality_domain_of(ptr) != d)
@@ -186,7 +195,7 @@ static constexpr int kChainLineStride = 7;
 static constexpr float kMinFarNearRatio = 1.25f;
 static constexpr int kNumMaxProbeAttempts = 5;
 
-static void launch_probe(const torch::Tensor& buf, const torch::Tensor& latency) {
+static void launch_probe(const torch::stable::Tensor& buf, const torch::stable::Tensor& latency) {
     const auto kernel = jit->compile("sm107_locality_probe_chase", std::format(R"(
 #include <deep_gemm/impls/sm107_locality_probe.cuh>
 
@@ -206,78 +215,39 @@ static void __instantiate_kernel() {{
 }
 
 // `(num_domains, num_sms)` median cycles per hop
-static torch::Tensor probe(const torch::Tensor& buf) {
-    const auto options = torch::dtype(torch::kInt).device(buf.device());
-    auto chain = torch::zeros({kProbeHops, kProbeLineBytes / 4}, options);
-    chain.select(1, 0).copy_((torch::arange(kProbeHops, options) + kChainLineStride) % kProbeHops * (kProbeLineBytes / 4));
-    const auto num_sms = buf.size(1);
-    const auto latency = torch::zeros({buf.size(0), num_sms, kProbeChunksPerSM}, buf.options().dtype(torch::kInt16));
-    for (int64_t d = 0; d < buf.size(0); ++ d)
-        buf[d].view(torch::kInt).view({-1, kProbeChunkBytes / 4}).copy_(chain.view(-1).unsqueeze(0));
-    // Flush L2 so that every hop is a fill from memory
-    torch::zeros({256 << 20}, torch::dtype(torch::kUInt8).device(buf.device()));
-    for (int64_t d = 0; d < buf.size(0); ++ d)
-        launch_probe(buf[d], latency[d]);
-    DG_HOST_ASSERT(latency.gt(0).all().item<bool>());
-    return std::get<0>(latency.to(torch::kFloat).median(-1));
-}
 
-static torch::Tensor try_probe(const torch::Tensor& buf) {
-    const auto [latency, order] = probe(buf).sort(0);
-    const auto sm_domain = order[0].to(torch::kUInt8);
-    const auto tpcs = sm_domain.view({-1, kNumSMsPerTPC});
-    const auto clear = latency[1].ge(latency[0] * kMinFarNearRatio).all().item<bool>();
-    const auto consistent = torch::equal(tpcs, tpcs.select(1, 0).unsqueeze(1).expand_as(tpcs));
-    return clear and consistent ? sm_domain : torch::Tensor();
-}
+inline torch::stable::Tensor& balanced_sm_locality_domains = *new torch::stable::Tensor();
 
-// Without a stable probe, an arbitrary SM mapping is still functionally correct
-static torch::Tensor get_even_sm_locality_domains(const int& num_domains) {
-    const auto tpc_idx = torch::arange(jit->device.get_num_sms() / kNumSMsPerTPC, torch::dtype(torch::kInt).device(torch::kCUDA));
-    return (tpc_idx % num_domains).to(torch::kUInt8).repeat_interleave(kNumSMsPerTPC);
-}
-
-static torch::Tensor probe_sm_locality_domains(const int& num_domains) {
-    const auto num_sms = jit->device.get_num_sms();
-    const auto buf = empty_per_domain({num_sms, kProbeChunksPerSM, kProbeChunkBytes}, torch::kUInt8);
-    for (int attempt = 0; attempt < kNumMaxProbeAttempts; ++ attempt) {
-        if (const auto sm_domain = try_probe(buf); sm_domain.defined())
-            return sm_domain;
-    }
-    pybind11::module_::import("warnings").attr("warn")("SM107 MegaMoE: the SM locality-domain probe found no stable mapping; using an even one");
-    return get_even_sm_locality_domains(num_domains);
-}
-
-// Give both domains the same number of TPCs (the surplus TPCs of the larger domain move to the smaller one)
-static torch::Tensor balance_sm_locality_domains(const torch::Tensor& sm_domain) {
-    const auto tpcs = sm_domain.view({-1, kNumSMsPerTPC});
-    const auto tpc_domain = tpcs.select(1, 0);
-    DG_HOST_ASSERT(tpcs.size(0) % 2 == 0);
-    const int64_t num_tpcs = tpcs.size(0), num_domain_1 = tpc_domain.sum().item<int64_t>();
-    const uint8_t larger = num_domain_1 * 2 > num_tpcs;
-    const auto surplus = (tpc_domain == larger).nonzero().flatten().slice(0, num_tpcs / 2);
-    const auto balanced = sm_domain.clone();
-    balanced.view({-1, kNumSMsPerTPC}).index_fill_(0, surplus, larger ^ 1);
-    return balanced;
-}
-
-// Cached per process (one device per process in vLLM); never destroyed (see above)
-inline torch::Tensor& sm_locality_domains = *new torch::Tensor();
-inline torch::Tensor& balanced_sm_locality_domains = *new torch::Tensor();
-
-static torch::Tensor get_sm_locality_domains() {
-    if (not sm_locality_domains.defined()) {
-        const int num_domains = get_num_locality_domains();
-        DG_HOST_ASSERT(num_domains == 2 and "the SM107 per-die path supports exactly 2 locality domains");
-        sm_locality_domains = probe_sm_locality_domains(num_domains);
-    }
-    return sm_locality_domains;
-}
-
-static torch::Tensor get_balanced_sm_locality_domains() {
-    if (not balanced_sm_locality_domains.defined())
-        balanced_sm_locality_domains = balance_sm_locality_domains(get_sm_locality_domains());
+static torch::stable::Tensor get_balanced_sm_locality_domains() {
+    DG_HOST_ASSERT(balanced_sm_locality_domains.defined() and
+                   "Warm deep_gemm.mega.sm107_locality before the first per-die kernel");
     return balanced_sm_locality_domains;
 }
 
-}  // namespace deep_gemm::sm107_locality
+static void set_balanced_sm_locality_domains(const torch::stable::Tensor& domains) {
+    DG_HOST_ASSERT(domains.scalar_type() == torch::headeronly::ScalarType::Byte);
+    DG_HOST_ASSERT(domains.is_cuda() and domains.is_contiguous());
+    DG_HOST_ASSERT(domains.numel() == jit->device.get_num_sms());
+    balanced_sm_locality_domains = domains;
+}
+
+static int64_t num_domains_op() { return get_num_locality_domains(); }
+
+} // namespace deep_gemm::sm107_locality
+
+STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+    m.def("sm107_get_num_locality_domains() -> int");
+    m.def("sm107_empty_per_domain(int[] sizes, ScalarType dtype) -> Tensor");
+    m.def("sm107_is_localized(Tensor t) -> bool");
+    m.def("sm107_probe(Tensor buf, Tensor(a!) latency) -> ()");
+    m.def("sm107_set_balanced_sm_locality_domains(Tensor domains) -> ()");
+}
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {
+    m.impl("sm107_get_num_locality_domains", TORCH_BOX(&deep_gemm::sm107_locality::num_domains_op));
+    m.impl("sm107_empty_per_domain", TORCH_BOX(&deep_gemm::sm107_locality::empty_per_domain));
+}
+STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    m.impl("sm107_is_localized", TORCH_BOX(&deep_gemm::sm107_locality::is_localized));
+    m.impl("sm107_probe", TORCH_BOX(&deep_gemm::sm107_locality::launch_probe));
+    m.impl("sm107_set_balanced_sm_locality_domains", TORCH_BOX(&deep_gemm::sm107_locality::set_balanced_sm_locality_domains));
+}

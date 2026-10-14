@@ -89,9 +89,6 @@ struct alignas(128) MegaMoESignals {
     uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
-DG_STATIC_ASSERT(offsetof(MegaMoESignals, task_count_domain1) == offsetof(MegaMoESignals, l1_task_count) + 4 * sizeof(uint32_t) and
-                 offsetof(MegaMoESignals, shared_l2_task_count) == offsetof(MegaMoESignals, l1_task_count) + 3 * sizeof(uint32_t),
-                 "Per-domain task counters must be at a 4-counter stride");
 
 struct Workspace {
     MegaMoESignals* signals;

@@ -315,9 +315,14 @@ static void fp8_fp4_mega_moe(
     // Tensor checks
     // NOTES: the opt-in SM107 per-die path also accepts weights localized into the 2 locality domains:
     // routed `(2, E, N / 2, K)` and shared `(2, N / 2, K)`, slice `d` homed in domain `d` (see `sm107_locality.hpp`)
-    const bool localized_weights = l1_weights.dim() == 4;
+    const auto [device_major, device_minor] = jit->device.get_arch_pair();
+    const bool use_sm107 = device_major == 10 and device_minor == 7 and activation == "swiglu" and
+                          deep_jit::get_env<int>("DG_MEGA_MOE_SM107", 0) != 0;
+    const bool localized_weights = use_sm107 and l1_weights.dim() == 4;
     const auto arch_major = jit->device.get_arch_major();
     const auto check_routed_weights = [&](const torch::stable::Tensor& w) -> std::tuple<int, int, int> {
+        if (not use_sm107)
+            return check_weights_layout_3d(w);
         if (not localized_weights) {
             DG_HOST_ASSERT(get_major_type_ab(w) == cute::UMMA::Major::K);
             return check_grouped_ab_fp8_fp4(w, cute::UMMA::Major::K, arch_major);
@@ -336,7 +341,10 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
-    DG_HOST_ASSERT(localized_weights or (l1_weights.is_contiguous() and l2_weights.is_contiguous()));
+    if (use_sm107)
+        DG_HOST_ASSERT(localized_weights or (l1_weights.is_contiguous() and l2_weights.is_contiguous()));
+    else
+        DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -353,6 +361,10 @@ static void fp8_fp4_mega_moe(
         std::tie(shared_l2_weights, shared_l2_weights_sf) = shared_l2_weights_tuple_opt.value();
         // Logical `(N, K)` of plain `(N, K)` or localized `(2, N / 2, K)` shared weights
         const auto get_shared_shape = [&](const torch::stable::Tensor& w) -> std::pair<int64_t, int64_t> {
+            if (not use_sm107) {
+                const auto [n, k] = check_weights_layout_2d(w);
+                return {n, k};
+            }
             if (w.dim() != 3) {
                 DG_HOST_ASSERT(w.dim() == 2 and w.is_contiguous() and get_major_type_ab(w) == cute::UMMA::Major::K);
                 return {w.size(0), w.size(1)};
@@ -363,7 +375,11 @@ static void fp8_fp4_mega_moe(
         const auto [shared_l1_n, shared_l1_k] = get_shared_shape(shared_l1_weights);
         const auto [shared_l2_n, shared_l2_k] = get_shared_shape(shared_l2_weights);
         DG_HOST_ASSERT(shared_l1_weights.dim() == shared_l2_weights.dim());
-        localized_shared_weights = shared_l1_weights.dim() == 3;
+        localized_shared_weights = use_sm107 and shared_l1_weights.dim() == 3;
+        if (not use_sm107) {
+            DG_HOST_ASSERT(is_localized(shared_l1_weights) == is_localized(l1_weights));
+            DG_HOST_ASSERT(is_localized(shared_l2_weights) == is_localized(l2_weights));
+        }
         shared_intermediate_hidden = static_cast<int>(shared_l2_k);
         num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
 
@@ -428,8 +444,6 @@ static void fp8_fp4_mega_moe(
                    activation_args...);
         };
         // Opt-in Rubin (SM107) kernel: `DG_MEGA_MOE_SM107=1` on a compute capability 10.7 device
-        const auto [arch_major_, arch_minor] = jit->device.get_arch_pair();
-        const bool use_sm107 = arch_minor == 7 and deep_jit::get_env<int>("DG_MEGA_MOE_SM107", 0) != 0;
         DG_HOST_ASSERT((not (localized_weights or localized_shared_weights) or (use_sm107 and activation == "swiglu")) and
                        "localized MegaMoE weights need the SM107 kernel (DG_MEGA_MOE_SM107=1)");
         if (activation == "situ") {

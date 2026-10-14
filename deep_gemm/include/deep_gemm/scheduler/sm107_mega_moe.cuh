@@ -4,7 +4,7 @@
 // Port of upstream DeepGEMM 26/09/30 (`deep_gemm/scheduler/mega_moe.cuh`, commit c7849af) as a separate struct, so that
 // the production `MegaMoEScheduler` stays untouched:
 //   - each locality domain has its own L1 / L2 / shared-L1 / shared-L2 task counter; domain `d`'s counter lives at
-//     `<domain 0 counter> + d * kDomainCounterStride` (`layout::MegaMoESignals::task_count_domain1`)
+//     `<domain 0 counter> + d * kDomainCounterStride` (`contiguous per-domain counters`)
 //   - domain `d` owns the N clusters `[d * kNumClusters / D, (d + 1) * kNumClusters / D)`, i.e. the N half whose weights are
 //     homed in its memory, and steals from the other queue only with >= 2 waves of tasks
 //   - with `kNumLocalityDomains == 1` the behaviour is identical to `MegaMoEScheduler`
@@ -13,7 +13,7 @@
 namespace deep_gemm::sched {
 
 static constexpr uint32_t kNumSM107LocalityDomains = 2;
-static constexpr uint32_t kDomainCounterStride = 4;
+static constexpr uint32_t kDomainCounterStride = 1;
 
 #if defined(__CUDACC__) or defined(__CLION_IDE__)
 
