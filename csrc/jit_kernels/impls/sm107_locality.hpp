@@ -125,7 +125,7 @@ static torch::stable::Tensor empty_per_domain(const std::vector<int64_t>& sizes,
     DJ_CUDA_DRIVER_CHECK(lazy_cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
     const auto elem_size = static_cast<int64_t>(torch_compat::element_size(dtype));
-    const auto num_slice_bytes = align<int64_t>(locality_domain::numel(sizes) * elem_size, static_cast<int64_t>(granularity));
+    const auto num_slice_bytes = align<int64_t>(locality_domain::stable_ops::numel(sizes) * elem_size, static_cast<int64_t>(granularity));
     DG_HOST_ASSERT(num_slice_bytes % elem_size == 0);
 
     CUdeviceptr base = 0;
@@ -152,12 +152,11 @@ static torch::stable::Tensor empty_per_domain(const std::vector<int64_t>& sizes,
 
     std::vector<int64_t> full_sizes = {num_domains}, strides = {num_slice_bytes / elem_size};
     full_sizes.insert(full_sizes.end(), sizes.begin(), sizes.end());
-    const auto slice_strides = locality_domain::contiguous_strides(sizes);
+    const auto slice_strides = locality_domain::stable_ops::contiguous_strides(sizes);
     strides.insert(strides.end(), slice_strides.begin(), slice_strides.end());
-    // Stable ABI 2.10 has no from_blob deleter. Like the base allocator,
-    // reservations are process-owned so views can outlive the original tensor.
+    // The stable 2.11 API owns the reservation until its last tensor view is released.
     return torch::stable::from_blob(reinterpret_cast<void*>(base), full_sizes, strides,
-                                    locality_domain::current_cuda_device(), dtype);
+                                    locality_domain::stable_ops::current_cuda_device(), dtype, release);
 #else
     DG_HOST_UNREACHABLE("locality domains need CUDA >= 13.4 headers");
 #endif
@@ -171,7 +170,7 @@ static bool is_localized(const torch::stable::Tensor& t) {
     std::vector<int64_t> slice_sizes;
     for (int i = 1; i < t.dim(); ++i)
         slice_sizes.push_back(t.size(i));
-    const auto strides = locality_domain::contiguous_strides(slice_sizes);
+    const auto strides = locality_domain::stable_ops::contiguous_strides(slice_sizes);
     for (int i = 1; i < t.dim(); ++i)
         if (t.stride(i) != strides[i - 1])
             return false;

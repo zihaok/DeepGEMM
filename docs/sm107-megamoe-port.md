@@ -1,7 +1,8 @@
-# Rubin MegaMoE port onto a981d8e
+# Rubin MegaMoE port onto a7a9277
 
 Source: nvzhihanj/DeepGEMM, dsv41-rubin-megamoe-sm107, c50dea4.
-Target: vllm-project/DeepGEMM, a981d8e3a58e877b7f53e63707de5834312fb710.
+Initial target: vllm-project/DeepGEMM, a981d8e3a58e877b7f53e63707de5834312fb710.
+Current target: vllm-project/DeepGEMM, a7a927731b109fdfec770df7c2a5be5d7e2216b5.
 
 The source branch is preserved as source/dsv41-rubin-megamoe-sm107.
 rubin-megamoe-squashed contains two source-tree-equivalent commits: the
@@ -26,6 +27,20 @@ The old SM107-to-100f JIT workaround was not replayed: the target includes it.
   Its previous prefix slice converted a nearly balanced map into a 2/206
   split on the test GPU and hung both SM100 and SM107 per-die launches.
 
+## October 16 rebase compatibility
+
+The five custom commits through c84c10a were replayed onto a7a9277 for
+vLLM main 8a6c0449. The upstream Stepfun activation dispatch, PyTorch 2.11
+stable ABI, localized-allocation lifetimes, and lazy C++ locality initialization
+are retained. SM107 dispatch still applies only to SwiGLU.
+
+The native SM107 Python locality balancer now lives in mega/sm107_locality.py,
+with its regression test importing that helper directly. Upstream's restored
+C++ balancer remains unchanged; its surplus slice is already correct.
+The native allocator uses the relocated locality_domain::stable_ops helpers
+and the stable 2.11 from_blob deleter, so allocations are released when their
+last tensor view is destroyed.
+
 ## Dependencies and usage
 
 The CUTLASS and DeepJIT submodule pins are unchanged. Default SM107 dispatch
@@ -42,13 +57,20 @@ get_balanced_sm_locality_domains before CUDA graph capture. Scale tensors
 remain unlocalized. The source's tuning and debug environment knobs remain
 available; debug skip flags do not produce valid numerical results.
 
-The stable ABI 2.10 from_blob API has no storage deleter callback. Native
-localized reservations are therefore process-owned, as in the target's
-stable-ABI locality allocator, rather than freed when individual tensors die.
-Repeated model unload/reload can retain allocations until process exit.
-The locality caches retain the original one-device-per-process assumption.
+The stable ABI 2.11 from_blob API retains native localized reservations
+until the last tensor view is released. The locality caches retain the
+original one-device-per-process assumption.
 
-## Validation boundary
+## October 16 rebase validation boundary
+
+The stable extension compiles on ARM64 with CUDA 13.4 and PyTorch
+2.16.0a0+0291f960b6 using the unchanged upstream CUTLASS and DeepJIT pins.
+All seven locality-balancer regression cases pass on CPU through the compiled
+package. The custom SM107 kernel, scheduler, and JIT launcher source are
+unchanged from c84c10a. GPU JIT, model correctness, and serving throughput
+still require validation in the rebuilt vLLM container.
+
+## Initial-port validation boundary
 
 The extension builds in an x86_64 CUDA 13.4 / PyTorch 2.15 development container.
 The seven locality-balancer regression cases pass. Single-GPU comparisons
